@@ -1,0 +1,13 @@
+# Orchestration & Gateway
+langgraph
+langchain-core
+litellm
+
+# Data & Database (For upcoming days)
+psycopg2-binary
+pgvector
+sqlalchemy
+
+# Utils
+python-dotenv
+pydantic
