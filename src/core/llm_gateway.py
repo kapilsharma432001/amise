@@ -5,6 +5,7 @@ from litellm.exceptions import APIConnectionError, RateLimitError, Timeout
 
 load_dotenv()
 
+
 class LLMGateway:
     def __init__(self):
         # We define a fallback list. If OpenAI fails, we can try other providers.

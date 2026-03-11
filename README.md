@@ -1,1 +1,1 @@
-# amise
+# AMISE - Autonomous Market Intelligence & Strategy Engine
