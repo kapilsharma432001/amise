@@ -5,6 +5,18 @@ from litellm.exceptions import APIConnectionError, RateLimitError, Timeout
 
 load_dotenv()
 
+# A model gateway that provides a unified, resiliant interface to multiple LLM providers.
+# This is the only module in the entire system that talks to LLMs directly. 
+# Every other component (RAG, Agents, tools) calls this gateway
+
+"""
+Capabilities:
+- Unified interface for multiple LLM providers (OpenAI, Anthropic, etc.)
+- Built-in fallback mechanism: If one provider fails, automatically switch to the next.
+- Error handling: Catches and logs exceptions, ensuring the system remains robust.
+- Structured logging for every request
+- Async-first design for high throughput agent workloads
+"""
 
 class LLMGateway:
     def __init__(self):
