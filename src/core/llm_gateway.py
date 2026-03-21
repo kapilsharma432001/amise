@@ -1,51 +1,68 @@
-import os
-from dotenv import load_dotenv
-from litellm import completion
-from litellm.exceptions import APIConnectionError, RateLimitError, Timeout
-
-load_dotenv()
-
-# A model gateway that provides a unified, resiliant interface to multiple LLM providers.
-# This is the only module in the entire system that talks to LLMs directly. 
-# Every other component (RAG, Agents, tools) calls this gateway
-
 """
-Capabilities:
-- Unified interface for multiple LLM providers (OpenAI, Anthropic, etc.)
-- Built-in fallback mechanism: If one provider fails, automatically switch to the next.
-- Error handling: Catches and logs exceptions, ensuring the system remains robust.
-- Structured logging for every request
+AMISE - LLM gateway
+A production-grade model gateway that provides a unified, resilient interface to multiple LLM providers. This is the only module
+that talks to the LLMs directly, every other module - RAG, tools, agents - calls this gateway.
+
+Key Capabilities:
+- LiteLLM gives you one single interface that works for every provider, the response format - response.choices[0].message.content - is also same
+regardless of the provider, LiteLLM translates it internally.
+- automatic falllback from primary to seconday model
+- Exponential backoff 
+- Structured logging for every request (latency, tokens, cost)
 - Async-first design for high throughput agent workloads
-"""
 
-class LLMGateway:
-    def __init__(self):
-        # We define a fallback list. If OpenAI fails, we can try other providers.
-        self.model_fallbacks = ["openai/gpt-4o", "anthropic/claude-3-5-sonnet-20241022"]
+What is LiteLLM?
+
+
+Open source python library and proxy server that standardizes interactions with over 100 Large Language Models (LLMs) from providers like OpenAI, Antropic, Bedrock, and Gemini into a single API format.
+It simplifies switching between models, handles authentication/load balancing, and provides cost tracking.
+Think of it like this, if you want to call OpenAI, you write:
+from openai import OpenAI
+client = OpenAI()
+
+response = client.chat.completions.create(
+    model = "gpt-4o-mini",
+    messages = [{"role": "user", "content": "Hello"}]
+    )
     
-    def generate_strategy(self, prompt: str) -> str:
-        """
-        Generates a response using LiteLLM with built-in fallbacks.
-        """
-        messages = [{"role": "user", "content": prompt}]
-        
-        try:
-            response = completion(
-                model = self.model_fallbacks[0],  # Try the primary model first
-                messages = messages,
-                fallbacks = self.model_fallbacks[1:],  # Triggers if primary model fails
-                num_retries = 2,
-            )
-            return response.choices[0].message.content.strip()
-        
-        except Exception as e:
-            return f"Critical Failure in LLM Gateway: {str(e)}"
+print(response.choices[0].message.content)
 
-# Quick test block
-if __name__ == "__main__":
-    gateway = LLMGateway()
-    print("Testing Gateway Setup...")
-    test_prompt = "What is the best strategy for a chess game?"
-    response = gateway.generate_strategy(test_prompt)
-    print("Response from LLM Gateway:")
-    print(response)
+ And tomorrow, your team says, “switch to Anthropic”, you rewrite everything:
+from anthropic import Anthropic
+client = Anthropic()
+
+response = client.message.create(
+    model = "claude-3-haiku-20240307",
+    max_tokens = 1024,
+    messages = [{"role": "User", "content": "Hello"}]
+    )
+    
+print(response.content[0].text)
+
+Notice the problem, different import, different method name, different response structure (response.choices[0].message.content) vs (response.content[0].text). 
+If you have used these calls in 50 files across your project, switching providers means rewriting 50 files across your project. This is a provider-coupled code - your business logic is tightly bound to one vendor’s SDK.
+What LiteLLM does?
+LiteLLM gives you one single interface that works for every provider:
+import litellm
+
+# Call OpenAI
+response = await litellm.acompletion(
+    model = "gpt-4o-mini",
+    messages = [{"role": "user", "content": "Hello"}]
+    )
+
+# Call Anthropic - SAME code, just change the model string
+response = await litellm.autocompletion(
+    model = "claude-3-haiku-20240307",
+    messages = [{"role": "user", "content": "Hello"}]
+    )
+
+# Call Mistral - again, SAME code
+response = await litellm.acompletion(
+    model = "mistral/mistral-large-latest",
+    messages = [{"role": "user", "content": "hello"}]
+    )
+
+The response format is also always the same - response.choices[0].message.content - regardless of which provider actually served the request. LiteLLM translates internally.
+
+"""
