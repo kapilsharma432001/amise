@@ -66,3 +66,55 @@ response = await litellm.acompletion(
 The response format is also always the same - response.choices[0].message.content - regardless of which provider actually served the request. LiteLLM translates internally.
 
 """
+
+import os
+import time
+from typing import Any, Dict, List, Optional
+
+import litellm
+import structlog
+from dotenv import load_dotenv
+
+# tenacity is a popular, general-purpose library designed to simplify the task of adding retry logic to code
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential_jitter,
+    retry_if_exception_type,
+)
+
+# read .env file form os.environ
+load_dotenv()
+
+# Supress LiteLLM's verbose internal logs; we use our own logging
+litellm.supress_debug_info = True
+litellm.drop_params  = True
+
+# Initialize structured logger for this module
+logger = structlog.get_logger(__name__)
+
+
+# CONFIGURATION: Centralized, immutable settings
+class GatewayConfig:
+    PRIMARY_MODEL: str = os.getenv("PRIMARY_MODEL", "gpt-4o-mini")
+    FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "claude-3-haiku-20240307")
+    TIMEOUT: int = int(os.getenv("LLM_REQUEST_TIMEOUT", "30"))  # seconds
+    MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", "3"))
+
+    # cost guardrails - refuse any single call that would exceed this
+    MAX_TOKENS_HARD_LIMIT: int = int(os.getenv("MAX_TOKENS_HARD_LIMIT", "4096"))
+
+
+# Custom exception for LLM errors - fine grained error taxonomy
+class LLMGatewayError(Exception):
+    """Base exception for all gateway failures."""
+    pass
+
+class LLMProviderError(LLMGatewayError):
+    """Raised when all the LLM providers (primary + fallback) have failed."""
+    pass
+
+class LLMConfigError(LLMGatewayError):
+    """Raised for the configuration issues (missing keys, invalid model names)."""
+    pass
+
