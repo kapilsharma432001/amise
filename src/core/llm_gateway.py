@@ -118,3 +118,68 @@ class LLMConfigError(LLMGatewayError):
     """Raised for the configuration issues (missing keys, invalid model names)."""
     pass
 
+# The single entrypoint for all the LLM intersactions in the AMISE system
+class LLMGateway:
+    """
+    The single entrypoint for all the LLM interactions in the AMISE system.
+
+    Architecture Pattern: ** Facade + Strategy **
+    - Facade: Hide the complexity of multiple LLM providers behind a single 'generate()' method.
+    - Strategy: The retry and fallback logic can be swapped without changing the ccalling code.
+    
+    Usage:
+        gateway = LLMGateway()
+        response = await gateway.generate(
+            prompt = "Analyze the competitive landascape for EV companies.",
+            system_message = "You are a senior market analyst.",
+            )
+        print(response["content"])
+    """
+
+    def __init__(self, config: Optional[GatewayConfig] = None):
+        """
+        Initialize the gateway with standard configuration.
+
+        Args:
+            config (GatewayConfig, optional): Custom configuration for the gateway. If None, defaults will be used. 
+            Defaults to environment based config.
+            This pattern enables dependency injection for testing.
+
+            Dependency Injection (DI) is a software design pattern that decpuples classes from their depndencies,
+            allowing objects to receive their required dependencies from an external source rather than creating them internally.
+
+        """
+        self.config = config or GatewayConfig()
+        self._validate_environment()
+
+        logger.info(
+            "llm_gateway.initialized",
+            primary_model = self.config.PRIMARY_MODEL,
+            fallback_model = self.config.FALLBACK_MODEL,
+            timeout = self.config.TIMEOUT,
+        )
+
+        def _validate_environment(self):
+            """
+            Fail fast: check that required API keys exist at the startup,
+            not at the first LLM call which could be minutes later
+            """
+
+            required_key = []
+
+            if "gpt" in self.config.PRIMARY_MODEL.lower() or "gpt" in self.config.FALLBACK_MODEL.lower():
+                required_key.append("OPENAI_API_KEY")
+            if "claude" in self.config.PRIMARY_MODEL.lower() or "claude" in self.config.FALLBACK_MODEL.lower():
+                required_key.append("ANTHROPIC_API_KEY")
+
+            missing = [key for key in required_key if not os.getenv(key)]
+
+            if missing:
+                raise LLMConfigError(
+                    f"Missing required API keys: {missing}.",
+                    f"Add them to your .env file."
+                )
+            
+
+
+        
