@@ -360,3 +360,66 @@ class EmbeddingEngine:
             input=texts,
         )
         return [item["embedding"] for item in response.data]
+
+# BM25 Engine - in-memory lexical search using rank_bm25 library (keyword-based, not semantic)
+class BM25Engine:
+    """
+    In-memory BM25 index for lexical search.
+
+    BM25 (Best Matching 25) scores documents based on:
+    - TF: How often does the query term appear in the doc? (saturating)
+    - IDF: How rare is the query term across all docs? (rarer = better)
+    - DL: How long is the doc relative to average? (normalizes for length)
+
+    The formula: score(q,d) = Σ IDF(t) x [TF(t,d) x (k1+1)] / [TF(t,d) + k1 x (1 - b + b x |d|/avgdl)]
+    Default k1=1.5, b=0.75 — these are battle-tested values from IR research.
+    """
+
+    def __init__(self):
+        self.index: Optional[BM25Okapi] = None
+        self.corpus_docs: list[dict] = []  # Parallel array to BM25 internal corpus
+
+    def build_index(self, documents: list[dict]) -> None:
+        """
+        Build the BM25 index from a list of documents.
+
+        Tokenization here is simple whitespace split + lowercasing.
+        Production improvement: use spaCy or NLTK for proper tokenization,
+        stopword removal, and stemming. But for AMISE, this is sufficient.
+        """
+        self.corpus_docs = documents
+        tokenized_corpus = [
+            doc["content"].lower().split() for doc in documents
+        ]
+        self.index = BM25Okapi(tokenized_corpus)
+
+        logger.info("bm25_engine.index_built", num_documents=len(documents))
+
+    def search(self, query: str, top_k: int = 20) -> list[dict]:
+        """
+        Score all documents against the query and return top_k.
+
+        Returns documents with BM25 scores (not normalized to 0-1).
+        RRF doesn't need normalized scores — it only uses ranks.
+        """
+        if self.index is None:
+            logger.warning("bm25_engine.search_called_before_build")
+            return []
+
+        tokenized_query = query.lower().split()
+        scores = self.index.get_scores(tokenized_query)
+
+        # Pair scores with documents and sort descending
+        scored_docs = [
+            {
+                "doc_id": doc["doc_id"],
+                "content": doc["content"],
+                "metadata": doc["metadata"],
+                "score": float(score),
+            }
+            for doc, score in zip(self.corpus_docs, scores)
+            if score > 0  # Skip zero-score documents
+        ]
+
+        scored_docs.sort(key=lambda x: x["score"], reverse=True)
+        return scored_docs[:top_k]
