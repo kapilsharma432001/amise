@@ -64,10 +64,11 @@ class RetrievalResult:
     metadata: dict
     source: str  # "dense", "sparse", or "hybrid"
 
-
+    
 class DocumentStore:
     """
-    Manages the PostgresSQL + pgvector storage layer
+    Manages the PostgreSQL + pgvector storage layer.
+
     Responsibility: ONLY handles database operations.
     Does NOT handle search logic — that's the retriever's job.
 
@@ -75,15 +76,16 @@ class DocumentStore:
     - DocumentStore = storage (CRUD)
     - HybridRetriever = search intelligence (ranking, fusion)
     """
+
     def __init__(self, dsn: str):
         """
         Args:
             dsn: PostgreSQL connection string.
-                 Format: postgresql://user:pass@host:port/dbname
+                Format: postgresql://user:pass@host:port/dbname
         """
         self.dsn = dsn
         self.pool: Optional[asyncpg.Pool] = None
-    
+
     async def initialize(self) -> None:
         """
         Create connection pool and set up schema.
@@ -92,7 +94,7 @@ class DocumentStore:
         - Creating a new DB connection takes ~50-100ms (TCP + TLS + auth).
         - A pool keeps connections warm and reuses them.
         - For an agent making 10 retrieval calls in parallel,
-            this means 10x50ms=500ms saved per agent cycle.
+        this means 10x50ms=500ms saved per agent cycle.
         """
         self.pool = await asyncpg.create_pool(
             self.dsn,
@@ -107,7 +109,7 @@ class DocumentStore:
             await self._create_schema(conn)
 
         logger.info("document_store.initialized", dsn=self.dsn[:30] + "...")
-    
+
     async def _create_schema(self, conn: asyncpg.Connection) -> None:
         """
         Create the documents table with vector column and indexes.
@@ -116,9 +118,9 @@ class DocumentStore:
         - UNIQUE(doc_id): prevents duplicate ingestion
         - vector(1536): matches text-embedding-3-small output dimension
         - ivfflat index: approximate nearest neighbor for fast search
-          (exact search is O(n), IVFFlat is O(√n) with minor recall loss)
+        (exact search is O(n), IVFFlat is O(√n) with minor recall loss)
         - GIN index on content: accelerates full-text search if we add
-          PostgreSQL tsvector search later
+        PostgreSQL tsvector search later
         """
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
@@ -143,181 +145,100 @@ class DocumentStore:
         """)
 
         logger.info("document_store.schema_ready")
-    
-    class DocumentStore:
+
+    async def insert_document(
+        self, doc_id: str, content: str, metadata: dict, embedding: list[float]
+    ) -> bool:
         """
-        Manages the PostgreSQL + pgvector storage layer.
+        Insert a single document. Returns True if inserted, False if duplicate.
 
-        Responsibility: ONLY handles database operations.
-        Does NOT handle search logic — that's the retriever's job.
-
-        This separation follows the Single Responsibility Principle:
-        - DocumentStore = storage (CRUD)
-        - HybridRetriever = search intelligence (ranking, fusion)
+        ON CONFLICT DO NOTHING: idempotent ingestion.
+        Running the same ingestion pipeline twice won't create duplicates.
+        This is critical in production where pipelines get retried.
         """
-
-        def __init__(self, dsn: str):
-            """
-            Args:
-                dsn: PostgreSQL connection string.
-                    Format: postgresql://user:pass@host:port/dbname
-            """
-            self.dsn = dsn
-            self.pool: Optional[asyncpg.Pool] = None
-
-        async def initialize(self) -> None:
-            """
-            Create connection pool and set up schema.
-
-            Why a connection pool?
-            - Creating a new DB connection takes ~50-100ms (TCP + TLS + auth).
-            - A pool keeps connections warm and reuses them.
-            - For an agent making 10 retrieval calls in parallel,
-            this means 10x50ms=500ms saved per agent cycle.
-            """
-            self.pool = await asyncpg.create_pool(
-                self.dsn,
-                min_size=2,      # Always keep 2 connections warm
-                max_size=10,     # Never exceed 10 (protects the DB)
-                command_timeout=30,
+        async with self.pool.acquire() as conn:
+            await register_vector(conn)
+            result = await conn.execute(
+                """
+                INSERT INTO documents (doc_id, content, metadata, embedding)
+                VALUES ($1, $2, $3::jsonb, $4::vector)
+                ON CONFLICT (doc_id) DO NOTHING;
+                """,
+                doc_id,
+                content,
+                json.dumps(metadata),
+                embedding,
             )
+            # result is "INSERT 0 1" if inserted, "INSERT 0 0" if skipped
+            return result == "INSERT 0 1"
 
-            # Register pgvector type so asyncpg can handle vector columns
-            async with self.pool.acquire() as conn:
-                await register_vector(conn)
-                await self._create_schema(conn)
+    async def fetch_all_contents(self) -> list[dict]:
+        """
+        Fetch all document IDs and contents for BM25 index building.
 
-            logger.info("document_store.initialized", dsn=self.dsn[:30] + "...")
+        Why load all content into memory for BM25?
+        - BM25 is an in-memory algorithm — it needs the full corpus to
+        compute IDF (inverse document frequency) scores.
+        - For <100k chunks, this fits comfortably in memory (~500MB).
+        - Beyond that, switch to Elasticsearch or PostgreSQL tsvector.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT doc_id, content, metadata FROM documents ORDER BY id;"
+            )
+            return [
+                {
+                    "doc_id": row["doc_id"],
+                    "content": row["content"],
+                    "metadata": json.loads(row["metadata"]),
+                }
+                for row in rows
+            ]
 
-        async def _create_schema(self, conn: asyncpg.Connection) -> None:
-            """
-            Create the documents table with vector column and indexes.
+    async def dense_search(
+        self, query_embedding: list[float], top_k: int = 20
+    ) -> list[dict]:
+        """
+        Perform vector cosine similarity search using pgvector.
 
-            Design decisions in the schema:
-            - UNIQUE(doc_id): prevents duplicate ingestion
-            - vector(1536): matches text-embedding-3-small output dimension
-            - ivfflat index: approximate nearest neighbor for fast search
-            (exact search is O(n), IVFFlat is O(√n) with minor recall loss)
-            - GIN index on content: accelerates full-text search if we add
-            PostgreSQL tsvector search later
-            """
-            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        The SQL uses <=> operator which is pgvector's cosine distance.
+        We compute similarity as (1 - distance) so higher = more similar.
 
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS documents (
-                    id          SERIAL PRIMARY KEY,
-                    doc_id      TEXT UNIQUE NOT NULL,
-                    content     TEXT NOT NULL,
-                    metadata    JSONB DEFAULT '{}',
-                    embedding   vector(1536),
-                    created_at  TIMESTAMPTZ DEFAULT NOW()
-                );
-            """)
-
-            # IVFFlat index: lists=100 is good for up to ~100k documents.
-            # For 1M+ docs, switch to HNSW index.
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_documents_embedding
-                ON documents
-                USING ivfflat (embedding vector_cosine_ops)
-                WITH (lists = 100);
-            """)
-
-            logger.info("document_store.schema_ready")
-
-        async def insert_document(
-            self, doc_id: str, content: str, metadata: dict, embedding: list[float]
-        ) -> bool:
-            """
-            Insert a single document. Returns True if inserted, False if duplicate.
-
-            ON CONFLICT DO NOTHING: idempotent ingestion.
-            Running the same ingestion pipeline twice won't create duplicates.
-            This is critical in production where pipelines get retried.
-            """
-            async with self.pool.acquire() as conn:
-                await register_vector(conn)
-                result = await conn.execute(
-                    """
-                    INSERT INTO documents (doc_id, content, metadata, embedding)
-                    VALUES ($1, $2, $3::jsonb, $4::vector)
-                    ON CONFLICT (doc_id) DO NOTHING;
-                    """,
+        Why top_k=20 when we might only need 5 final results?
+        - We over-retrieve from each method, then let RRF pick the best.
+        - This gives RRF more candidates to work with, improving recall.
+        """
+        async with self.pool.acquire() as conn:
+            await register_vector(conn)
+            rows = await conn.fetch(
+                """
+                SELECT
                     doc_id,
                     content,
-                    json.dumps(metadata),
-                    embedding,
-                )
-                # result is "INSERT 0 1" if inserted, "INSERT 0 0" if skipped
-                return result == "INSERT 0 1"
+                    metadata,
+                    1 - (embedding <=> $1::vector) AS similarity
+                FROM documents
+                ORDER BY embedding <=> $1::vector
+                LIMIT $2;
+                """,
+                query_embedding,
+                top_k,
+            )
+            return [
+                {
+                    "doc_id": row["doc_id"],
+                    "content": row["content"],
+                    "metadata": json.loads(row["metadata"]),
+                    "score": float(row["similarity"]),
+                }
+                for row in rows
+            ]
 
-        async def fetch_all_contents(self) -> list[dict]:
-            """
-            Fetch all document IDs and contents for BM25 index building.
-
-            Why load all content into memory for BM25?
-            - BM25 is an in-memory algorithm — it needs the full corpus to
-            compute IDF (inverse document frequency) scores.
-            - For <100k chunks, this fits comfortably in memory (~500MB).
-            - Beyond that, switch to Elasticsearch or PostgreSQL tsvector.
-            """
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT doc_id, content, metadata FROM documents ORDER BY id;"
-                )
-                return [
-                    {
-                        "doc_id": row["doc_id"],
-                        "content": row["content"],
-                        "metadata": json.loads(row["metadata"]),
-                    }
-                    for row in rows
-                ]
-
-        async def dense_search(
-            self, query_embedding: list[float], top_k: int = 20
-        ) -> list[dict]:
-            """
-            Perform vector cosine similarity search using pgvector.
-
-            The SQL uses <=> operator which is pgvector's cosine distance.
-            We compute similarity as (1 - distance) so higher = more similar.
-
-            Why top_k=20 when we might only need 5 final results?
-            - We over-retrieve from each method, then let RRF pick the best.
-            - This gives RRF more candidates to work with, improving recall.
-            """
-            async with self.pool.acquire() as conn:
-                await register_vector(conn)
-                rows = await conn.fetch(
-                    """
-                    SELECT
-                        doc_id,
-                        content,
-                        metadata,
-                        1 - (embedding <=> $1::vector) AS similarity
-                    FROM documents
-                    ORDER BY embedding <=> $1::vector
-                    LIMIT $2;
-                    """,
-                    query_embedding,
-                    top_k,
-                )
-                return [
-                    {
-                        "doc_id": row["doc_id"],
-                        "content": row["content"],
-                        "metadata": json.loads(row["metadata"]),
-                        "score": float(row["similarity"]),
-                    }
-                    for row in rows
-                ]
-
-        async def close(self) -> None:
-            """Gracefully close the connection pool."""
-            if self.pool:
-                await self.pool.close()
-                logger.info("document_store.closed")
+    async def close(self) -> None:
+        """Gracefully close the connection pool."""
+        if self.pool:
+            await self.pool.close()
+            logger.info("document_store.closed")
 
 # Embedding Engine - convert text to vectors using LiteLLM's aembedding() which abstracts away the provider (OpenAI, Anthropic, etc.)
 class EmbeddingEngine:
@@ -423,3 +344,42 @@ class BM25Engine:
 
         scored_docs.sort(key=lambda x: x["score"], reverse=True)
         return scored_docs[:top_k]
+
+# the orchestrator
+class HybridRetriever:
+    """
+    Orchestrates Dense + Sparse retrieval and fuses results using RRF.
+
+    This is the class that the rest of AMISE (agents, API) interacts with.
+    It delegates to DocumentStore (storage), EmbeddingEngine (vectors),
+    and BM25Engine (lexical), then merges everything via RRF.
+
+    Design pattern: **Mediator**
+    - Coordinates interactions between DocumentStore, EmbeddingEngine,
+      and BM25Engine without them knowing about each other.
+    """
+    class HybridRetriever:
+        """
+        Orchestrates Dense + Sparse retrieval and fuses results using RRF.
+
+        This is the class that the rest of AMISE (agents, API) interacts with.
+        It delegates to DocumentStore (storage), EmbeddingEngine (vectors),
+        and BM25Engine (lexical), then merges everything via RRF.
+
+        Design pattern: **Mediator**
+        - Coordinates interactions between DocumentStore, EmbeddingEngine,
+        and BM25Engine without them knowing about each other.
+        """
+
+        def __init__(self, database_url: str, rrf_k: int = 60):
+            """
+            Args:
+                database_url: PostgreSQL DSN string.
+                rrf_k: RRF smoothing constant (default 60 from original paper).
+                    Higher k = less emphasis on top-ranked results.
+                    Lower k  = more winner-take-all behavior.
+            """
+            self.store = DocumentStore(dsn=database_url)
+            self.embedder = EmbeddingEngine()
+            self.bm25 = BM25Engine()
+            self.rrf_k = rrf_k
