@@ -143,3 +143,220 @@ class DocumentStore:
         """)
 
         logger.info("document_store.schema_ready")
+    
+    class DocumentStore:
+        """
+        Manages the PostgreSQL + pgvector storage layer.
+
+        Responsibility: ONLY handles database operations.
+        Does NOT handle search logic — that's the retriever's job.
+
+        This separation follows the Single Responsibility Principle:
+        - DocumentStore = storage (CRUD)
+        - HybridRetriever = search intelligence (ranking, fusion)
+        """
+
+        def __init__(self, dsn: str):
+            """
+            Args:
+                dsn: PostgreSQL connection string.
+                    Format: postgresql://user:pass@host:port/dbname
+            """
+            self.dsn = dsn
+            self.pool: Optional[asyncpg.Pool] = None
+
+        async def initialize(self) -> None:
+            """
+            Create connection pool and set up schema.
+
+            Why a connection pool?
+            - Creating a new DB connection takes ~50-100ms (TCP + TLS + auth).
+            - A pool keeps connections warm and reuses them.
+            - For an agent making 10 retrieval calls in parallel,
+            this means 10x50ms=500ms saved per agent cycle.
+            """
+            self.pool = await asyncpg.create_pool(
+                self.dsn,
+                min_size=2,      # Always keep 2 connections warm
+                max_size=10,     # Never exceed 10 (protects the DB)
+                command_timeout=30,
+            )
+
+            # Register pgvector type so asyncpg can handle vector columns
+            async with self.pool.acquire() as conn:
+                await register_vector(conn)
+                await self._create_schema(conn)
+
+            logger.info("document_store.initialized", dsn=self.dsn[:30] + "...")
+
+        async def _create_schema(self, conn: asyncpg.Connection) -> None:
+            """
+            Create the documents table with vector column and indexes.
+
+            Design decisions in the schema:
+            - UNIQUE(doc_id): prevents duplicate ingestion
+            - vector(1536): matches text-embedding-3-small output dimension
+            - ivfflat index: approximate nearest neighbor for fast search
+            (exact search is O(n), IVFFlat is O(√n) with minor recall loss)
+            - GIN index on content: accelerates full-text search if we add
+            PostgreSQL tsvector search later
+            """
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS documents (
+                    id          SERIAL PRIMARY KEY,
+                    doc_id      TEXT UNIQUE NOT NULL,
+                    content     TEXT NOT NULL,
+                    metadata    JSONB DEFAULT '{}',
+                    embedding   vector(1536),
+                    created_at  TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+
+            # IVFFlat index: lists=100 is good for up to ~100k documents.
+            # For 1M+ docs, switch to HNSW index.
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_documents_embedding
+                ON documents
+                USING ivfflat (embedding vector_cosine_ops)
+                WITH (lists = 100);
+            """)
+
+            logger.info("document_store.schema_ready")
+
+        async def insert_document(
+            self, doc_id: str, content: str, metadata: dict, embedding: list[float]
+        ) -> bool:
+            """
+            Insert a single document. Returns True if inserted, False if duplicate.
+
+            ON CONFLICT DO NOTHING: idempotent ingestion.
+            Running the same ingestion pipeline twice won't create duplicates.
+            This is critical in production where pipelines get retried.
+            """
+            async with self.pool.acquire() as conn:
+                await register_vector(conn)
+                result = await conn.execute(
+                    """
+                    INSERT INTO documents (doc_id, content, metadata, embedding)
+                    VALUES ($1, $2, $3::jsonb, $4::vector)
+                    ON CONFLICT (doc_id) DO NOTHING;
+                    """,
+                    doc_id,
+                    content,
+                    json.dumps(metadata),
+                    embedding,
+                )
+                # result is "INSERT 0 1" if inserted, "INSERT 0 0" if skipped
+                return result == "INSERT 0 1"
+
+        async def fetch_all_contents(self) -> list[dict]:
+            """
+            Fetch all document IDs and contents for BM25 index building.
+
+            Why load all content into memory for BM25?
+            - BM25 is an in-memory algorithm — it needs the full corpus to
+            compute IDF (inverse document frequency) scores.
+            - For <100k chunks, this fits comfortably in memory (~500MB).
+            - Beyond that, switch to Elasticsearch or PostgreSQL tsvector.
+            """
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT doc_id, content, metadata FROM documents ORDER BY id;"
+                )
+                return [
+                    {
+                        "doc_id": row["doc_id"],
+                        "content": row["content"],
+                        "metadata": json.loads(row["metadata"]),
+                    }
+                    for row in rows
+                ]
+
+        async def dense_search(
+            self, query_embedding: list[float], top_k: int = 20
+        ) -> list[dict]:
+            """
+            Perform vector cosine similarity search using pgvector.
+
+            The SQL uses <=> operator which is pgvector's cosine distance.
+            We compute similarity as (1 - distance) so higher = more similar.
+
+            Why top_k=20 when we might only need 5 final results?
+            - We over-retrieve from each method, then let RRF pick the best.
+            - This gives RRF more candidates to work with, improving recall.
+            """
+            async with self.pool.acquire() as conn:
+                await register_vector(conn)
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        doc_id,
+                        content,
+                        metadata,
+                        1 - (embedding <=> $1::vector) AS similarity
+                    FROM documents
+                    ORDER BY embedding <=> $1::vector
+                    LIMIT $2;
+                    """,
+                    query_embedding,
+                    top_k,
+                )
+                return [
+                    {
+                        "doc_id": row["doc_id"],
+                        "content": row["content"],
+                        "metadata": json.loads(row["metadata"]),
+                        "score": float(row["similarity"]),
+                    }
+                    for row in rows
+                ]
+
+        async def close(self) -> None:
+            """Gracefully close the connection pool."""
+            if self.pool:
+                await self.pool.close()
+                logger.info("document_store.closed")
+
+# Embedding Engine - convert text to vectors using LiteLLM's aembedding() which abstracts away the provider (OpenAI, Anthropic, etc.)
+class EmbeddingEngine:
+    """
+    Handles all text-to-vector conversions via LiteLLM.
+
+    Why a separate class instead of a function?
+    - Future: add embedding cache (avoid re-embedding the same text)
+    - Future: add batch optimization (embed 100 chunks in one API call)
+    - Testability: mock this class in unit tests
+    """
+
+    def __init__(self, model: str = EMBEDDING_MODEL):
+        self.model = model
+
+    async def embed_text(self, text: str) -> list[float]:
+        """
+        Embed a single text string into a vector.
+
+        Uses LiteLLM's aembedding() which routes to the correct
+        provider based on model name (OpenAI, Cohere, etc.).
+        """
+        response = await litellm.aembedding(
+            model=self.model,
+            input=[text],
+        )
+        return response.data[0]["embedding"]
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """
+        Embed multiple texts in a single API call.
+
+        Why batch? Because:
+        - 1 API call with 100 texts ≈ 200ms
+        - 100 API calls with 1 text each ≈ 100 × 200ms = 20,000ms
+        Batching gives ~100x speedup for ingestion.
+        """
+        response = await litellm.aembedding(
+            model=self.model,
+            input=texts,
+        )
+        return [item["embedding"] for item in response.data]
