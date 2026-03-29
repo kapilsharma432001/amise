@@ -383,3 +383,196 @@ class HybridRetriever:
             self.embedder = EmbeddingEngine()
             self.bm25 = BM25Engine()
             self.rrf_k = rrf_k
+        
+        async def initialize(self) -> None:
+            """Set up database and build BM25 index from existing documents."""
+            await self.store.initialize()
+
+            # Build BM25 index from whatever is already in the database
+            all_docs = await self.store.fetch_all_contents()
+            if all_docs:
+                self.bm25.build_index(all_docs)
+                logger.info(
+                    "hybrid_retriever.bm25_warm",
+                    doc_count=len(all_docs),
+                )
+        
+        # Ingestion: Add documents to the system
+        async def ingest(self, documents: list[Document]) -> dict:
+            """
+            Ingest documents: embed them and store in PostgreSQL.
+
+            Pipeline: Documents → Batch Embed → Store → Rebuild BM25
+
+            Returns a summary dict with counts.
+            """
+            if not documents:
+                return {"ingested": 0, "skipped": 0}
+
+            # Step 1: Batch embed all document contents
+            contents = [doc.content for doc in documents]
+            embeddings = await self.embedder.embed_batch(contents)
+
+            # Step 2: Store each document
+            ingested, skipped = 0, 0
+            for doc, embedding in zip(documents, embeddings):
+                was_inserted = await self.store.insert_document(
+                    doc_id=doc.doc_id,
+                    content=doc.content,
+                    metadata=doc.metadata,
+                    embedding=embedding,
+                )
+                if was_inserted:
+                    ingested += 1
+                else:
+                    skipped += 1
+
+            # Step 3: Rebuild BM25 index with new corpus
+            # (In production, you'd do incremental updates, not full rebuild)
+            all_docs = await self.store.fetch_all_contents()
+            self.bm25.build_index(all_docs)
+
+            logger.info(
+                "hybrid_retriever.ingestion_complete",
+                ingested=ingested,
+                skipped=skipped,
+            )
+            return {"ingested": ingested, "skipped": skipped}
+
+        
+        # The hybrid search pipeline
+        async def search(
+            self,
+            query: str,
+            top_k: int = 5,
+            dense_weight: float = 0.5,
+            sparse_weight: float = 0.5,
+        ) -> list[RetrievalResult]:
+            """
+            Execute hybrid search: Dense + Sparse → RRF fusion.
+
+            Args:
+                query: The natural language search query.
+                top_k: Number of final results to return.
+                dense_weight: Weight for dense results in RRF (0.0 to 1.0).
+                sparse_weight: Weight for sparse results in RRF (0.0 to 1.0).
+
+            Returns:
+                List of RetrievalResult sorted by hybrid relevance.
+            """
+            # Over-retrieve from both methods (4x final top_k)
+            candidate_count = top_k * 4
+
+            # --- Dense retrieval (semantic) ---
+            query_embedding = await self.embedder.embed_text(query)
+            dense_results = await self.store.dense_search(
+                query_embedding=query_embedding,
+                top_k=candidate_count,
+            )
+
+            # --- Sparse retrieval (lexical) ---
+            sparse_results = self.bm25.search(
+                query=query,
+                top_k=candidate_count,
+            )
+
+            # --- Fuse with Reciprocal Rank Fusion ---
+            fused = self._reciprocal_rank_fusion(
+                dense_results=dense_results,
+                sparse_results=sparse_results,
+                dense_weight=dense_weight,
+                sparse_weight=sparse_weight,
+            )
+
+            # Return only top_k final results
+            return fused[:top_k]
+
+        # RRF: The fusion algorithm
+        def _reciprocal_rank_fusion(
+            self,
+            dense_results: list[dict],
+            sparse_results: list[dict],
+            dense_weight: float,
+            sparse_weight: float,
+        ) -> list[RetrievalResult]:
+            """
+            Reciprocal Rank Fusion (Cormack et al., 2009).
+
+            Formula: RRF_score(doc) = Σ weight_i / (k + rank_i(doc))
+
+            Why RRF instead of simple score averaging?
+            - Dense scores (cosine similarity) range from -1 to 1
+            - BM25 scores range from 0 to infinity
+            - You CANNOT meaningfully average them — they're on different scales.
+            - RRF only uses RANKS (1st, 2nd, 3rd...), not raw scores.
+            - This makes it scale-invariant and parameter-free (except k).
+
+            The k parameter (default 60):
+            - Prevents the #1 result from dominating (1/1 = 1.0 vs 1/61 = 0.016)
+            - k=60 means rank #1 gets score 1/61=0.0164, rank #2 gets 1/62=0.0161
+            - The gap between adjacent ranks is small, so results from both
+            methods get a fair chance.
+            """
+            fused_scores: dict[str, dict] = {}
+
+            # Process dense results: assign RRF score based on rank position
+            for rank, doc in enumerate(dense_results):
+                doc_id = doc["doc_id"]
+                rrf_score = dense_weight / (self.rrf_k + rank + 1)
+
+                if doc_id not in fused_scores:
+                    fused_scores[doc_id] = {
+                        "content": doc["content"],
+                        "metadata": doc["metadata"],
+                        "score": 0.0,
+                        "in_dense": False,
+                        "in_sparse": False,
+                    }
+
+                fused_scores[doc_id]["score"] += rrf_score
+                fused_scores[doc_id]["in_dense"] = True
+
+            # Process sparse results: add their RRF contribution
+            for rank, doc in enumerate(sparse_results):
+                doc_id = doc["doc_id"]
+                rrf_score = sparse_weight / (self.rrf_k + rank + 1)
+
+                if doc_id not in fused_scores:
+                    fused_scores[doc_id] = {
+                        "content": doc["content"],
+                        "metadata": doc["metadata"],
+                        "score": 0.0,
+                        "in_dense": False,
+                        "in_sparse": False,
+                    }
+
+                fused_scores[doc_id]["score"] += rrf_score
+                fused_scores[doc_id]["in_sparse"] = True
+
+            # Convert to RetrievalResult and sort by fused score
+            results = []
+            for doc_id, data in fused_scores.items():
+                # Determine source label
+                if data["in_dense"] and data["in_sparse"]:
+                    source = "hybrid"    # Appeared in BOTH — highest confidence
+                elif data["in_dense"]:
+                    source = "dense"
+                else:
+                    source = "sparse"
+
+                results.append(
+                    RetrievalResult(
+                        doc_id=doc_id,
+                        content=data["content"],
+                        score=data["score"],
+                        metadata=data["metadata"],
+                        source=source,
+                    )
+                )
+
+            results.sort(key=lambda r: r.score, reverse=True)
+            return results
+
+        async def close(self) -> None:
+            """Release all resources."""
+            await self.store.close()
