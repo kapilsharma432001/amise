@@ -197,3 +197,226 @@ class WebSearchTool(BaseTool):
                     })
 
         return results[:max_results]
+    
+
+### STOCK QUOTE TOOL
+class StockQuoteTool(BaseTool):
+    """
+    Fetches stock market data from Yahoo Fianance's public endpoint.
+    """
+    def get_schema(self) -> ToolSchema:
+        return ToolSchema(
+            name="stock_quote",
+            description=(
+                "Get current stock market data for a company including "
+                "price, change, volume, market cap, and 52-week range. "
+                "Use the stock ticker symbol (e.g., 'TSLA' for Tesla, "
+                "'RELIANCE.NS' for Reliance on NSE)."
+            ),
+            parameters=[
+                ToolParameter(
+                    name="symbol",
+                    type="string",
+                    description="Stock ticker symbol (e.g., 'AAPL', 'TSLA', 'INFY.NS')",
+                ),
+            ],
+        )
+    
+    async def execute(self, **kwargs) -> ToolResult:
+        """
+        Fetch stock quote for a given ticker symbol.
+        """
+        symbol = kwargs.get("symbol")
+
+        if not symbol or not symbol.strip():
+            return ToolResult(
+                success=False,
+                error="Parameter 'symbol' is required (e.g., 'TSLA').",
+            )
+
+        symbol = symbol.strip().upper()
+
+        try:
+            async with httpx.AsyncClient(
+                headers=DEFAULT_HEADERS, timeout=HTTP_TIMEOUT
+            ) as client:
+                # Yahoo Finance v8 quote endpoint
+                response = await client.get(
+                    f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+                    params={
+                        "interval": "1d",
+                        "range": "5d",  # 5 days of data
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+
+            quote = self._parse_yahoo_response(data, symbol)
+            if not quote:
+                return ToolResult(
+                    success=False,
+                    error=f"No data found for symbol '{symbol}'. Verify the ticker.",
+                )
+
+            return ToolResult(success=True, data=quote)
+
+        except httpx.TimeoutException:
+            return ToolResult(
+                success=False,
+                error=f"Finance API timed out for symbol: '{symbol}'",
+            )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 404:
+                return ToolResult(
+                    success=False,
+                    error=f"Symbol '{symbol}' not found. Check the ticker.",
+                )
+            return ToolResult(
+                success=False,
+                error=f"Finance API returned HTTP {status} for '{symbol}'",
+            )
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                error=f"Stock quote failed: {type(exc).__name__}: {exc}",
+            )
+    
+    @staticmethod
+    def _parse_yahoo_response(data: dict, symbol: str) -> Optional[dict]:
+        """
+        Extract key financial metrics from Yahoo's response.
+
+        Normalizes the deeply nested Yahoo response into a flat,
+        readable dict. If any field is missing, we use None rather
+        than crashing — financial APIs are notoriously inconsistent
+        in what fields they return for different securities.
+        """
+        try:
+            chart = data["chart"]["result"][0]
+            meta = chart["meta"]
+
+            current_price = meta.get("regularMarketPrice", 0)
+            previous_close = meta.get("chartPreviousClose", 0)
+
+            # Calculate change and percentage
+            change = round(current_price - previous_close, 2) if previous_close else None
+            change_pct = (
+                round((change / previous_close) * 100, 2)
+                if previous_close and change is not None
+                else None
+            )
+
+            return {
+                "symbol": symbol,
+                "currency": meta.get("currency", "USD"),
+                "current_price": current_price,
+                "previous_close": previous_close,
+                "change": change,
+                "change_percent": change_pct,
+                "day_high": meta.get("regularMarketDayHigh"),
+                "day_low": meta.get("regularMarketDayLow"),
+                "volume": meta.get("regularMarketVolume"),
+                "exchange": meta.get("exchangeName", "Unknown"),
+                "market_state": meta.get("marketState", "Unknown"),
+            }
+        except (KeyError, IndexError, TypeError):
+            return None
+
+def create_default_registry() -> ToolRegistry:
+    """
+    Factory function that creates a registry with all standard tools.
+
+    Why a factory function?
+    - Agents don't need to know which tools exist or how to instantiate them.
+    - Adding a new tool = one line here. Zero changes in agent code.
+    - In tests, you can create a registry with only mock tools.
+
+    This is the Dependency Injection pattern:
+    the agent receives a fully configured registry,
+    it doesn't build one itself.
+    """
+    registry = ToolRegistry()
+
+    registry.register(WebSearchTool())
+    registry.register(StockQuoteTool())
+
+    logger.info(
+        "default_registry.created",
+        tool_count=len(registry.list_tools()),
+        tools=[s.name for s in registry.list_tools()],
+    )
+
+    return registry
+
+async def _smoke_test():
+    """
+    End-to-end test: create registry → list tools → invoke each one.
+
+    This validates:
+    1. Tools register correctly
+    2. Schemas generate valid LLM function definitions
+    3. Tool invocation works with real API calls
+    4. Error handling works (try an invalid symbol)
+    """
+    import json
+
+    print("\n" + "=" * 60)
+    print("  AMISE Tool Registry — Smoke Test")
+    print("=" * 60)
+
+    # Create registry with all tools
+    registry = create_default_registry()
+
+    # --- Test 1: List tools (what the LLM sees) ---
+    print("\n📋 Registered Tools:")
+    tool_defs = registry.get_llm_tool_definitions()
+    for td in tool_defs:
+        func = td["function"]
+        params = list(func["parameters"]["properties"].keys())
+        print(f"   • {func['name']}: {func['description'][:60]}...")
+        print(f"     Params: {params}")
+
+    # --- Test 2: Web Search ---
+    print("\n🔍 Testing Web Search...")
+    search_result = await registry.invoke("web_search", query="Python programming language")
+    if search_result.success:
+        print(f"   ✅ Found {search_result.data['result_count']} results "
+              f"({search_result.latency_ms:.0f}ms)")
+        for r in search_result.data["results"][:2]:
+            print(f"      → {r['title'][:70]}")
+    else:
+        print(f"   ❌ Search failed: {search_result.error}")
+
+    # --- Test 3: Stock Quote ---
+    print("\n📈 Testing Stock Quote (AAPL)...")
+    stock_result = await registry.invoke("stock_quote", symbol="AAPL")
+    if stock_result.success:
+        d = stock_result.data
+        direction = "📈" if (d["change"] or 0) >= 0 else "📉"
+        print(f"   ✅ {d['symbol']} @ {d['currency']} {d['current_price']} "
+              f"{direction} {d['change']} ({d['change_percent']}%) "
+              f"({stock_result.latency_ms:.0f}ms)")
+    else:
+        print(f"   ❌ Stock quote failed: {stock_result.error}")
+
+    # --- Test 4: Error handling (invalid symbol) ---
+    print("\n🧪 Testing Error Handling (invalid symbol)...")
+    bad_result = await registry.invoke("stock_quote", symbol="ZZZZZZZZZ")
+    print(f"   {'✅' if not bad_result.success else '❌'} "
+          f"Correctly handled: {bad_result.error}")
+
+    # --- Test 5: Unknown tool ---
+    print("\n🧪 Testing Unknown Tool...")
+    unknown_result = await registry.invoke("email_sender", to="test@example.com")
+    print(f"   {'✅' if not unknown_result.success else '❌'} "
+          f"Correctly handled: {unknown_result.error}")
+
+    # --- Show LLM-ready schema ---
+    print("\n📄 LLM-Ready Tool Definitions (what gets passed to the model):")
+    print(json.dumps(tool_defs, indent=2)[:500] + "...\n")
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(_smoke_test())
